@@ -1,0 +1,802 @@
+---
+title: "Traitement du signal et des images"
+author: "Juliette BRAULT, Damien PERES"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+# Chargement des bibliothèques
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(corrplot)
+library(ggplot2)
+library(zoo)
+library(fda)
+```
+
+
+# Import du jeu de données
+
+Nous commençons par charger le jeu de données et corriger le formatage des dates pour permettre une analyse temporelle.
+
+```{r}
+df <- read.csv(file = "worldometer_coronavirus_daily_data.csv")
+summary(df)
+str(df)
+```
+
+Nous pouvons remarquer que la date n'est pas au format attendu (format Date). Ainsi :
+
+```{r}
+df$date <- as.Date(df$date)
+str(df)
+```
+
+Les colonnes sont à présent au bon format.
+
+# Introduction
+
+## Contexte
+
+La pandémie de COVID-19 a généré une quantité massive de données temporelles permettant de suivre la propagation du virus à l'échelle mondiale. Ces données constituent un cas idéal pour l'analyse de données fonctionnelles (ADF). 
+
+Ainsi, l'objectif de ce projet est d'appliquer les méthodes de statistique fonctionnelle pour analyser, comparer et synthétiser les dynamiques de contamination et de décès de différents pays.
+
+## Présentation du jeu de données
+
+Le jeu de données utilisé provient de Worldometer. Le fichier initial contient le suivi quotidien de la pandémie pour 226 pays. 
+
+Les données couvrent la période allant du 15 février 2020 au 14 mai 2022. Pour chaque pays et chaque jour, plusieurs variables sont disponibles :
+
+- date (au format YYYY-MM-DD)
+- country (nom du pays en anglais)
+- cumulative_total_cases : représente le nombre cumulé de cas confirmés
+- daily_new_cases : indique le nombre de nouveaux cas confirmés à la date donnée
+- active_cases : correspond au nombre de cas actifs
+- cumulative_total_deaths : indique le nombre cumulé de décès confirmés 
+- daily_new_deaths : représente le nombre de nouveaux décès confirmés à la date donnée
+
+Dans le cadre de cette étude, nous nous concentrerons principalement sur les variables daily_new_cases et daily_new_deaths (uniquement dans la partie Statistique descriptive), en plus de la date et le pays.
+
+## Sélection des pays
+
+L'analyse de l'ensemble des 226 pays s'avérant peu lisible, nous avons décidé de ne garder que 20 pays pour la suite de notre analyse.
+
+```{r}
+pays <- c("USA", "France", "Spain", "Brazil", "India", "UK", "South Korea", "Russia", "Argentina", "Germany", "Viet Nam", "Netherlands", "Italy", "Australia", "Turkey", "Belgium", "Poland", "Indonesia", "Japan", "Mexico")
+
+df <- df %>% filter(country %in% pays)
+```
+
+
+## Visualisations graphiques
+
+Avant d'entamer la modélisation fonctionnelle, une visualisation des données est indispensable pour appréhender la diversité des signaux. 
+
+Les graphiques montrent les tendances temporelles des cas et décès quotidiens de COVID-19 par pays, permettant de comparer l'évolution de la pandémie dans différents pays.
+
+```{r}
+colors <- c(
+  "#9EDAe5", "#377EB8", "#FFFF33", "#984EA3", "#FF7F00",
+  "#4DAF4A", "#E41A1C", "#F781BF", "#999999", "#66C2A5",
+  "#000000", "#8DA0CB", "#A52A2A", "#A6D854", "#FFD92F",
+  "#E5C494", "#DBDB8D", "#0000FF", "#A65628", "#7570B3"
+)
+
+ggplot(df, aes(x = date, y = daily_new_cases, color = country, group = country)) +
+  geom_line(size = 0.5) +
+  labs(title = "Évolution des nombres de cas de COVID-19 quotidiens",
+       x = "Date",
+       y = "Nombre de cas",
+       color = "Pays") +
+  theme_minimal()+
+  scale_color_manual(values = colors) +
+    theme(legend.position = "right",
+        legend.text = element_text(size = 8),
+        legend.key.height = unit(0.5, "cm"))
+```
+
+Le graphique révèle des profils très contrastés. Certains pays, comme la Corée du Sud ou le Vietnam, présentent des courbes relativement plates durant 2020 et 2021, suivies d'un pic début 2022. À l'inverse, d'autres pays (USA, Inde) montrent une succession régulière de vagues dès fin 2020. On remarque une forte variabilité (aspect "dents de scie") sur toutes les courbes. Cela justifie le besoin d'un lissage fonctionnel pour extraire les tendances épidémiologiques des pays.
+
+```{r}
+colors <- c(
+  "#9EDAe5", "#377EB8", "#FFFF33", "#984EA3", "#FF7F00",
+  "#4DAF4A", "#E41A1C", "#F781BF", "#999999", "#66C2A5",
+  "#000000", "#8DA0CB", "#A52A2A", "#A6D854", "#FFD92F",
+  "#E5C494", "#DBDB8D", "#0000FF", "#A65628", "#7570B3"
+)
+
+ggplot(df, aes(x = date, y = daily_new_deaths, color = country, group = country)) +
+  geom_line(size = 0.5) +
+  labs(title = "Évolution des nombres de décès liés au COVID-19",
+       x = "Date",
+       y = "Nombre de décès",
+       color = "Pays") +
+  theme_minimal()+
+  scale_color_manual(values = colors) +
+    theme(legend.position = "right",
+        legend.text = element_text(size = 8),
+        legend.key.height = unit(0.5, "cm"))
+```
+
+On distingue clairement que la période la plus critique est située durant l'hiver 2020-2021, où la mortalité quotidienne atteint des pics maximales (notamment au USA, en Inde et au Brésil). Alors que les cas de COVID ont explosé en 2022 pour certains pays, les décès sont proportionnellement plus faibles à cette période (notamment pour la France, la Belgique, l'Allemagne...).
+
+# Statistiques descriptives
+
+Les tableaux synthétisent les caractéristiques épidémiques majeures de notre échantillon. Ils permettent de quantifier les disparités observées précédemment sur les graphiques.
+
+```{r}
+tableau_stats <- df %>%
+  group_by(country) %>%
+  summarise(
+    # Nombre de cas total : 
+    total_cas = sum(daily_new_cases, na.rm = TRUE),
+    
+    # Le record de cas en un jour :
+    pic_max = max(daily_new_cases, na.rm = TRUE),
+    
+    # La date du pic
+    date_pic = date[which.max(daily_new_cases)],
+    
+    # Moyenne quotidienne de cas
+    Moyenne = round(mean(daily_new_cases, na.rm = TRUE), 0)
+  ) %>%
+  arrange(desc(total_cas)) # On trie par pays le plus touché
+
+# Tableau
+kable(tableau_stats, 
+      caption = "Statistiques descriptives des cas confirmés de COVID-19 par pays",
+      col.names = c("Pays", "Total cumulé", "Pic max", "Date du pic", "Moyenne par jour"))
+```
+
+Les États-Unis dominent largement le classement avec plus de 84 millions de cas cumulés, soit près du double de l'Inde (43 millions) ou le triple de la France (29 millions). 
+
+De plus, la Corée du Sud enregistre le 2ème pic journalier le plus important, bien qu'elle ne soit que 8ème en nombre total de cas. Cela traduit une épidémie extrêmement concentrée dans le temps. À l'inverse, le Brésil a un nombre de cas élevé mais un pic proportionnellement moins extrême, suggérant une diffusion plus étalée dans le temps. 
+
+Enfin, on remarque une désynchronisation temporelle marquée. En effet, l'Inde se distingue avec un pic majeur le 6 mai 2021, bien avant les autres pays. La majorité des pays ont atteint leur maximum de cas autour de la mi-janvier/début février 2022, tandis que certains pays (Allemagne, Vietnam, Corée du sud) ont connu leur pic de cas en mars 2022.
+
+
+```{r}
+tableau_stats <- df %>%
+  group_by(country) %>%
+  summarise(
+    # Nombre de décès total : 
+    total_deces = sum(daily_new_deaths, na.rm = TRUE),
+    
+    # Le record de décès en un jour :
+    pic_max = max(daily_new_deaths, na.rm = TRUE),
+    
+    # La date du pic
+    date_pic = date[which.max(daily_new_deaths)],
+    
+    # Moyenne quotidienne de décès
+    Moyenne = round(mean(daily_new_deaths, na.rm = TRUE), 0)
+  ) %>%
+  arrange(desc(total_deces)) # On trie par pays le plus touché
+
+# Tableau
+kable(tableau_stats, 
+      caption = "Statistiques descriptives des décès confirmés de COVID-19 par pays",
+      col.names = c("Pays", "Total cumulé", "Pic max", "Date du pic", "Moyenne par jour"))
+```
+
+Les États-Unis, le Brésil et l'Inde sont encore en haut du classement, avec respectivement environ 1 million, 665 000 et 524 000 morts comptabilisés. 
+
+De plus, l'analyse des statistiques de décès offre une perspective complémentaire et contrastée par rapport à celle des contaminations. En effet, alors que la majorité des pays ont eu un pic de cas mi-janvier/début février 2022, les dates des pics de décès sont plus anciennes. La France, l'Espagne, la Belgique ou encore les Pays-Bas ont connu leur journée la plus meurtrière lors de la toute première vague en avril 2020.
+
+
+On s'intéresse ici aux variables cumulative_total_cases (représente le nombre cumulé de cas confirmés) et cumulative_total_deaths (indique le nombre cumulé de décès confirmés). 
+
+```{r}
+df_france <- df %>% filter(country == "France")
+
+# Nombre de cas
+ggplot(df_france, aes(x = date, y = cumulative_total_cases)) +
+  geom_line(color = "#377EB8", size = 1) +
+  theme_minimal() +
+  labs(title = "Évolution du nombre cumulé de cas en France",
+       x = "Date",
+       y = "Nombre total de cas")
+
+# Nombre de décès
+ggplot(df_france, aes(x = date, y = cumulative_total_deaths)) +
+  geom_line(color = "#377EB8", size = 1) +
+  theme_minimal() +
+  labs(title = "Évolution du nombre cumulé de décès en France",
+       x = "Date",
+       y = "Nombre total de décès")
+```
+
+L'évolution du nombre total de cas déclarés en France n'est pas linéaire. En effet, on observe de 2020 à fin 2021 une croissance lente, et à partir de janvier 2022, la courbe adopte une trajectoire quasi-verticale, traduisant une augmentation rapide du nombre de cas sur une période courte.
+
+L'évolution des décès cumulés présente une croissance monotone ponctuée par des variations de pente significatives. On distingue nettement les périodes de forte mortalité lors de la vague de mars 2020 par exemple.
+
+
+On pourrait également calculé la corrélation entre le nombre de cas et de décès afin de quantifier le lien linéaire entre ces deux variables.
+
+```{r}
+correlation <- df %>%
+  group_by(country) %>%
+  summarise(
+    correlation_cas_deces = cor(daily_new_cases, daily_new_deaths, use = "complete.obs")
+  ) %>%
+  arrange(desc(correlation_cas_deces))
+
+correlation
+```
+En conclusion, ce tableau met en évidence une fracture nette entre les régions du monde. Une forte corrélation est observée en Asie et Océanie, tandis qu'une décorrélation marquée apparaît en Europe. 
+
+Il serait également intéressant de voir si plusieurs pays partagent des dynamiques temporelles semblables.
+
+```{r}
+data_corr <- df %>%
+  dplyr::select(date, country, daily_new_cases) %>%
+  pivot_wider(names_from = country, values_from = daily_new_cases) %>%
+  dplyr::select(-date)
+
+matrix_corr <- cor(data_corr, use = "complete.obs")
+
+corrplot(matrix_corr, method = "color", tl.col = "black", addCoef.col = "black",tl.cex = 0.7, number.cex = 0.4, title = "Matrice de corrélation des pays", mar = c(0,0,2,0))
+```
+
+La matrice de corrélation des pays confirme visuellement les disparités temporelles identifiées dans les statistiques descriptives. On observe un noyau dur de pays occidentaux (Europe de l'Ouest, USA) fortement corrélés, témoignant d'une synchronisation des vagues épidémiques. À l'inverse, des pays comme le Vietnam, la Corée du Sud ou l'Inde apparaissent faiblement corrélés au reste de l'échantillon. Cela corrobore l'observation des pics décalés (mai 2021 pour l'Inde, mars 2022 pour l'Asie de l'Est).
+
+# Lissage des données
+
+## Lissage par moindres carrés
+
+Nous utilisons dans un premier temps la France pour illustrer la méthodologie et optimiser les paramètres de lissage.
+
+```{r}
+df_france <- df %>% filter(country == "France")
+cas_covid_france <- df_france$daily_new_cases
+
+# Interpolation lineaire : l'argument 'rule=2' permet de prolonger la première ou la dernière valeur connue pour combler les NA
+cas_france <- na.approx(cas_covid_france, rule = 2)
+
+# L'axe temporel t
+temps_fr <- 1:length(cas_france)
+```
+
+Dans un premier temps, nous isolons la série des nouveaux cas quotidiens pour la France afin d'illustrer la procédure de lissage sur une trajectoire individuelle, comme vu dans le TD3. Les données présentent quelques valeurs manquantes, notamment au début de la période, ce qui empêche toute projection sur une base fonctionnelle. Nous appliquons donc une interpolation linéaire (na.approx avec règle de prolongation aux bords) afin de reconstruire ces points manquants sans modifier la taille de la série. Lorsque la première observation est manquante, nous la remplaçons par la première valeur disponible, l'interpolation ne pouvant être effectuée à l'extrémité gauche de la courbe.
+
+Nous construisons ensuite un axe temporel simple, allant de 1 au nombre total de jours. Ces données préparées serviront de base au lissage fonctionnel par B-splines.
+
+La série temporelle étant désormais complète et nettoyée, nous pouvons visualiser le signal brut que nous cherchons à modéliser.
+
+```{r}
+plot(df_france$date, cas_france, type="p", pch=20,
+     main="Trajectoire brute : Nombre de cas de COVID-19 quotidiens en France",
+     xlab="Date", ylab="Nombre de cas")
+```
+
+La figure ci-dessus représente la trajectoire brute des nouveaux cas quotidiens de COVID-19 en France sur l'ensemble de la période étudiée. 
+
+On observe une forte hétérogénéité temporelle, avec plusieurs vagues épidémiques d'amplitudes très différentes. Les premières valeurs sont faibles, puis la dynamique s'intensifie fortement à partir de début 2022. Les fluctuations rapides observées dans les données (notamment lors de la montée du pic en 2022) proviennent principalement d'irrégularités dans le système de déclaration (moins de tests le week-end, rattrapages, retards ou corrections). Ces effets introduisent du bruit qui ne reflète pas la dynamique réelle de l'épidémie, ce qui justifie l'utilisation d'un lissage fonctionnel.
+
+### Lissage avec le package fda
+
+Pour transformer ces points en fonction continue, nous projetons les données sur une base de fonctions B-Splines.
+
+Dans cette première approche, nous fixons arbitrairement des paramètres standards pour illustrer le mécanisme de la fonction Data2fd.
+
+```{r}
+nb_noeuds <- 15
+# Génération des noeuds internes sur la plage temporelles (en excluant la date de début et de fin)
+noeuds_internes <- seq(min(temps_fr), max(temps_fr), length.out = nb_noeuds + 2)[2:(nb_noeuds + 1)]
+
+base_spline_france <- create.bspline.basis(
+  rangeval = range(temps_fr),
+  norder = 4,                
+  breaks = noeuds_internes   
+)
+
+base_spline_france
+```
+
+Cette sortie décrit la base fonctionnelle utilisée pour représenter les trajectoires COVID. 
+Il s'agit d'une base de B-splines définie sur l'intervalle [1,820], correspondant à la durée totale en jour de l'étude. La base contient 17 fonctions élémentaires, construites à partir de 13 nœuds internes régulièrement espacés.
+
+Les fonctions (bspl4.1 à bspl4.17) constituent l'espace dans lequel les courbes sont projetées. Le nombre de nœuds et l'ordre de la spline déterminent la flexibilité de la représentation fonctionnelle : plus la base contient de fonctions, plus elle peut suivre les variations rapides du signal.
+
+Une fois la base définie, nous calculons les coefficients de la combinaison linéaire qui minimise l'erreur des moindres carrés par rapport aux données brutes.
+
+```{r}
+fd_france <- Data2fd(
+  argvals = temps_fr,
+  y = cas_france,
+  basisobj = base_spline_france)
+
+fd_france$coefs
+```
+
+La fonction Data2fd() permet de transformer la série temporelle brute en un objet fonctionnel en l'exprimant à l'aide de la base de splines définie précédemment. Elle estime automatiquement les coefficients qui décrivent la courbe lissée la mieux adaptée aux données, selon le critère des moindres carrés.
+
+Les coefficients obtenus varient fortement en amplitude : certains restent "proches" de zéro (par exemple bspl4.7 ≈ 3396), tandis que d'autres atteignent des valeurs très élevées, comme bspl4.15 ≈ 337 128 ou bspl4.14 ≈ 98 639.
+
+L'objet fd_france contient désormais la représentation fonctionnelle de la courbe.
+
+On a donc une version lissée de la trajectoire épidémique et qui pourra ensuite être évalué ou représenté graphiquement pour analyser plus clairement l'évolution des nouveaux cas au cours du temps.
+
+```{r}
+courbe_lissee_fr <- eval.fd(temps_fr, fd_france)
+```
+
+
+### Représentation de la courbe lissée estimée sur les données brutes mesurées
+
+```{r}
+plot(df_france$date, cas_france, pch=20,
+     main="Lissage de la courbe du nombre de cas quotidiens pour la France",
+     xlab="Date", ylab="Nombre de cas")
+lines(df_france$date, courbe_lissee_fr, col=4, lwd=2)
+```
+
+La figure ci-dessous présente la trajectoire brute des nouveaux cas quotidiens en France, ainsi que la courbe lissée obtenue à l'aide de la base de splines précédemment définie. Bien que la courbe bleue capture la tendance globale, elle semble trop rigide à certains endroits, notamment lors du pic majeur de janvier 2022 où elle peine à monter aussi haut que les données réelles. Cela suggère que les paramètres par défaut (Ordre 4, 15 nœuds) ne sont pas optimaux pour ces données.
+
+Nous verrons donc dans la suite quels paramètres il faudrait changer pour approcher au mieux les données avec le lissage. 
+
+### Variation de l'ordre (norder)
+
+Nous testons ici différents ordres (de 2 à 16) en fixant arbitrairement le nombre de nœuds à 15. L'objectif est de trouver l'ordre capable de suivre la montée verticale du pic de janvier 2022.
+
+```{r}
+ordres <- c(2, 3, 4, 6, 8, 10, 12, 14, 16)  
+par(mfrow=c(3,3), mar=c(4,4,2,1))
+
+nb_noeuds <- 15 
+noeuds_internes <- seq(min(temps_fr), max(temps_fr), length.out = nb_noeuds + 2)[2:(nb_noeuds + 1)]
+
+for (ordre in ordres) {
+  base_spline_ordre <- create.bspline.basis(
+    rangeval = range(temps_fr),
+    norder = ordre,
+    breaks = noeuds_internes)
+
+  fd_ordre <- Data2fd(argvals = temps_fr, y = cas_france, basisobj = base_spline_ordre)
+
+  courbe_lissee_ordre <- eval.fd(temps_fr, fd_ordre)
+
+  plot(df_france$date, cas_france, pch=20, cex=0.4,main = paste("Ordre =", ordre), xlab="Date", ylab="Nombre de cas")
+  lines(df_france$date, courbe_lissee_ordre, col=4, lwd=2)
+}
+```
+
+Les résultats montrent que :
+
+ - Avec un ordre 2 à 6, la base se révèle trop rigide. On observe un phénomène de sous-ajustement : la courbe lissée "coupe" les sommets des vagues épidémiques, ne parvenant pas à capturer l'intensité réelle des pics majeurs.
+
+ - Concernant les ordres 8 à 12, la courbe devient plus fluide et capture les principales tendances du signal.
+
+ - L'ordre 14, fournit le meilleur compromis : la courbe est suffisamment souple pour suivre l'évolution des cas, tout en restant régulière et stable face au bruit. C'est l'ordre qui reproduit le plus fidèlement la dynamique épidémique sans sur-ajustement.
+
+Dans l'ensemble, l'ordre 14 apparaît comme le choix le plus adapté pour lisser les séries temporelles COVID. Il permet une représentation fidèle des vagues tout en évitant les oscillations induites par des bases trop complexes. Nous retiendrons donc cet ordre pour la suite.
+
+### Variations des noeuds
+
+Nous étudions ici l'impact du nombre de nœuds utilisés dans la base B-spline sur le lissage des nouveaux cas quotidiens en France. Quatre valeurs ont été testées : 5, 10, 20 et 40 nœuds.
+
+```{r}
+nb_noeuds_seq <- c(5, 10, 20, 40)
+par(mfrow=c(2,2), mar=c(4,4,2,1))
+
+for (noeud in nb_noeuds_seq) {
+  noeuds_internes <- seq(min(temps_fr), max(temps_fr), length.out = noeud + 2)[2:(noeud + 1)]
+
+  base_spline_noeud <- create.bspline.basis(
+    rangeval = range(temps_fr),
+    norder = 14,
+    breaks = noeuds_internes)
+
+  fd_noeud <- Data2fd(argvals = temps_fr, y = cas_france, basisobj = base_spline_noeud)
+  courbe_lissee_noeud <- eval.fd(temps_fr, fd_noeud)
+
+  plot(df_france$date, cas_france, pch=20, cex=0.4, main = paste("Nombre de noeuds =", noeud), xlab="Date", ylab="Nombre de cas")
+  lines(df_france$date, courbe_lissee_noeud, col=4, lwd=2)
+}
+```
+
+Lorsque le nombre de nœuds est faible (par exemple 5), la courbe obtenue est très rigide et ne parvient pas à suivre correctement les variations de l'épidémie. Les différentes vagues sont fortement lissées et les pics sont sous-estimés. Il s'agit d'un cas de sous-ajustement, la base spline ne disposant pas d'assez de flexibilité.
+
+Avec 10 et 20 nœuds, la courbe devient plus adaptable et suit mieux les grandes tendances, mais reste encore trop lisse pour représenter fidèlement les évolutions rapides du nombre de cas. Les fluctuations importantes demeurent atténuées.
+
+À partir de 40 nœuds, le lissage devient suffisamment flexible pour capturer les variations essentielles du signal épidémique, sans introduire d'oscillations non désirées. Les pics sont mieux représentés et la dynamique globale est correctement restituée. Ce réglage apparaît comme le plus pertinent.
+
+### Lissage par moindres carrés (modèle final)
+
+Nous définissons donc notre modèle optimal par la combinaison : Ordre 14 + 40 nœuds.
+
+```{r}
+nb_noeuds <- 40
+noeuds_internes <- seq(min(temps_fr), max(temps_fr), length.out = nb_noeuds + 2)[2:(nb_noeuds + 1)]
+
+base_spline_france <- create.bspline.basis(
+  rangeval = range(temps_fr),
+  norder = 14,                
+  breaks = noeuds_internes)
+
+fd_france <- Data2fd(
+  argvals = temps_fr,
+  y = cas_france,
+  basisobj = base_spline_france)
+
+courbe_lissee_final_fr <- eval.fd(temps_fr, fd_france)
+
+plot(df_france$date, cas_france, pch=20, main="Lissage par moindres carrés (France)", xlab="Date", ylab="Nombre de cas")
+lines(df_france$date, courbe_lissee_final_fr, col=4, lwd=2)
+```
+
+Nous avons donc modifié les paramètres. Le nombre de nœuds internes est maintenant de 40 et permet ainsi de ne pas "écraser" les vagues de 2020 et 2021. Nous avons également modifié l'ordre de base, passant de 4 à 14, qui permet ainsi de bien capturer le pic de janvier 2022. 
+
+Ces paramètres seront également utilisés pour le lissage par moindres carrés de tous les pays.
+
+### Dérivées
+
+```{r}
+# Évaluation des dérivées sur une grille
+grille_eval <- seq(min(temps_fr), max(temps_fr), length.out = 400)
+
+deriv1_fr <- eval.fd(grille_eval, fd_france, Lfdobj = 1) # Vitesse
+deriv2_fr <- eval.fd(grille_eval, fd_france, Lfdobj = 2) # Accélération
+
+plot(df_france$date[round(grille_eval)], deriv1_fr, type="l",
+     main="Vitesse de l'épidémie en France (Dérivée 1ère)",
+     xlab="Date", ylab="Variation (Cas / jour)")
+
+plot(df_france$date[round(grille_eval)], deriv2_fr, type="l",
+     main="Accélération (Dérivée 2nde)",
+     xlab="Date", ylab="Accélération")
+```
+
+Les graphiques ci-dessus présentent la dérivée première et la dérivée seconde de la courbe lissée des nouveaux cas quotidiens de COVID-19 en France.
+
+La dérivée première, qui correspond à la vitesse d'évolution des cas, met en évidence les phases de croissance et de décroissance des différentes vagues épidémiques. Les zones où la dérivée première est positive traduisent une augmentation du nombre de cas, tandis que les zones négatives indiquent une diminution. On observe ainsi que entre 2020 et 2021, la vitesse oscille doucement. En revanche, entre fin 2021/début 2022, l'amplitude explose, passant de plus de 10000 à -15000. Cela signifie qu'a cette période, le COVID s'est propagé nettement plus vite.
+
+La dérivée seconde permet d'identifier les accélérations et décélérations du phénomène. Les pics vers le haut indiquent les moments d'accélération. À l'inverse, les pics vers le bas indiquent une décélération. C'est le moment où, même si les cas continuent d'augmenter, ils augmentent moins vite. Ainsi, on observe en fin 2021/début 2022 une accélération du nombre de cas, suivi d'une décélération de ceux-ci. 
+
+### Lissage sur tous les pays
+
+Pour rendre les courbes fonctionnelles comparables (notamment pour l'ACP), il est impératif de projeter l'ensemble des 20 pays sur cette même base commune.
+
+```{r}
+# Matrice globale (jours x pays)
+matrice_cas <- df %>%
+  dplyr::select(date, country, daily_new_cases) %>%
+  pivot_wider(names_from = country, values_from = daily_new_cases) %>%
+  dplyr::select(-date) %>%
+  as.matrix()
+
+# On retire les données manquantes
+matrice_cas <- apply(matrice_cas, 2, function(col) {
+  col <- na.approx(col, rule = 2)
+  return(col)
+})
+
+# L'axe temporel t
+temps <- 1:nrow(matrice_cas)
+
+nb_noeuds <- 40
+noeuds_internes <- seq(min(temps), max(temps), length.out = nb_noeuds + 2)[2:(nb_noeuds + 1)]
+
+base_spline_pays <- create.bspline.basis(
+  rangeval = range(temps),
+  norder = 14,
+  breaks = noeuds_internes)
+
+fd_pays <- Data2fd(argvals = temps, y = matrice_cas, basisobj = base_spline_pays)
+
+head(fd_pays$coefs)
+```
+
+Nous avons regroupé les trajectoires des nouveaux cas de COVID-19 pour l'ensemble des pays dans une matrice où chaque colonne correspond à un pays.
+
+Les données présentaient des valeurs manquantes ; afin de pouvoir appliquer un lissage fonctionnel, nous avons procédé à une correction en trois étapes : interpolation linéaire des valeurs internes, puis propagation des valeurs observées vers le début et vers la fin de la série. Cette procédure garantit qu'aucune trajectoire ne contient de données manquantes.
+
+Nous avons ensuite construit une base de B-splines, commune à tous les pays, puis appliqué la fonction Data2fd() pour transformer chaque série temporelle en une courbe lissée. Le résultat est un ensemble de coefficients représentant les trajectoires sous forme fonctionnelle, ce qui permet une analyse plus régulière et comparable entre les pays.
+
+### Représentation des courbes lissées pour tous les pays
+
+```{r}
+# Pour avoir le format date sur l'axe des abscisses sur les graphiques
+vecteur_dates <- sort(unique(df$date))
+```
+
+
+```{r}
+courbe_lissee_pays <- eval.fd(temps, fd_pays)
+
+matplot(vecteur_dates, courbe_lissee_pays, type = "l",
+        main = "Courbes lissées par moindres carrés de tous les pays",
+        xlab = "Date",
+        ylab = "Nombre de cas")
+```
+
+La figure ci-dessus montre les courbes lissées par moindre carrés pour les 20 pays.
+
+Les courbes observées présentent de fortes fluctuations quotidiennes, principalement liées aux irrégularités de déclaration des cas. Ces variations rendent difficile l'identification précise des tendances épidémiques.
+
+Le lissage permet d'éliminer ce bruit et de reconstruire des courbes plus régulières, qui mettent en évidence les grandes vagues de contamination propres à chaque pays. Les pics deviennent plus lisibles et les périodes de hausse ou de stabilisation sont mieux distinguées.
+
+Ainsi, cette étape transforme des données très irrégulières en objets fonctionnels beaucoup plus exploitables pour la suite de l'analyse (comparaisons entre pays, classification, ACP fonctionnelle, etc...).
+
+
+## Lissage par moindres carrés pénalisés
+
+Bien que le lissage précédent soit informatif, il reste sensible au choix arbitraire du nombre de nœuds. Une méthode plus robuste consiste à saturer le nombre de nœuds tout en imposant une pénalité de rugosité sur la dérivée seconde pour éviter l'oscillation excessive.
+
+### Lissage avec le package fda
+
+On reprend les données sur la France. Nous allons appliquer maintenant un lissage par moindres carrés pénalisés afin de contrôler davantage la régularité de la courbe.
+
+Nous cherchons tout d'abord le paramètre de régularisation optimal λ qui minimise le critère de Validation Croisée Généralisée (GCV).
+
+```{r}
+basespline_france <- create.bspline.basis(
+  rangeval = range(temps_fr),
+  norder = 14,
+  breaks = temps_fr)
+
+gcv <- 1:21
+
+for (i in gcv){
+  lambda_i <- exp(i-10)
+  fdparTemp_i <- fdPar(basespline_france, Lfdobj = 2, lambda = lambda_i)
+  # Lissage pénalisé
+  smoothdata_i <- smooth.basis(temps, cas_france, fdparTemp_i)
+  gcv[i] <- smoothdata_i$gcv
+}
+
+plot(gcv, type="b", main="Critère GCV en fonction de λ", xlab="λ", ylab="GCV")
+```
+
+Le graphique représente l'évolution du critère GCV en fonction de différentes valeurs du paramètre de régularisation λ utilisées dans le lissage pénalisé.
+
+Pour les petits λ, la pénalisation est très faible : le modèle suit trop fidèlement les fluctuations quotidiennes des données (sur-ajustement), ce qui se traduit par des valeurs de GCV élevées. En augmentant λ, le GCV diminue progressivement, signant que le lissage devient plus stable et capture mieux les tendances générales.
+
+Autour du minimum de la courbe, le compromis est optimal : la courbe lissée est suffisamment régulière tout en restant proche des observations.
+
+Le minimum du GCV correspond donc au λ optimal, qui sera utilisé pour produire le lissage final de la trajectoire française. 
+
+### Le λ optimal
+
+```{r}
+(best_index <- which.min(gcv))
+(lambda_opt <- exp(best_index - 10))
+```
+
+Le GCV présente un minimum pour i = 17, ce qui correspond à : λ optimal= exp(17−10) ≈ 1096.
+
+Le λ optimal trouvé peut paraître élevé en valeur absolue, mais cela est normal : les séries COVID présentent de fortes fluctuations quotidiennes, ce qui nécessite une pénalisation importante pour obtenir une courbe régulière. 
+
+### Application du modèle pénalisé optimal
+
+Nous appliquons donc ce λ optimal pour générer la courbe de la France.
+
+```{r}
+fdpar_opt <- fdPar(basespline_france, Lfdobj = 2, lambda = lambda_opt)
+smooth_opt <- smooth.basis(temps_fr, cas_france, fdpar_opt)
+
+plotfit.fd(cas_france, temps_fr, smooth_opt$fd, pch=20, cex=0.5, main="Lissage pénalisé avec paramètre optimal (France)")
+```
+
+Le graphique représente le lissage pénalisé de la trajectoire des nouveaux cas quotidiens en France.
+
+La courbe est nettement plus régulière que la trajectoire brute. En effet les vagues épidémiques apparaissent clairement, les pics irréguliers et les variations sont fortement atténués et les périodes calmes entre deux vagues sont bien mises en évidence.
+
+En bas de la figure, le logiciel affiche un RMS residual ≈ 26 340. Ce nombre peut sembler élevé, mais il est en réalité tout à fait normal au vu des ordres de grandeur des données : certains jours dépassent 300 000 cas, et les variations quotidiennes peuvent osciller de plusieurs dizaines de milliers de cas.
+
+Ainsi, une erreur moyenne d'environ 26 000 représente environ 8–9 % du niveau maximal, ce qui indique que le lissage reste globalement fidèle aux données tout en imposant la régularité souhaitée. Cette valeur confirme que le λ choisi offre un bon compromis entre ajustement et lissage, sans sur-ajuster le bruit ni sous-ajuster les tendances.
+
+
+###  Dérivées
+
+L'avantage majeur de la pénalisation sur la dérivée seconde est qu'elle garantit mathématiquement des dérivées lisses.
+
+```{r}
+courbe_liste_premiere <- eval.fd(temps_fr, smooth_opt$fd, Lfdobj = 1)
+courbe_liste_seconde <- eval.fd(temps_fr, smooth_opt$fd, Lfdobj = 2)
+
+matplot(temps_fr, cbind(courbe_liste_premiere, courbe_liste_seconde),
+        type = "l", lty = 1,
+        col = c("blue", "red"),
+        xlab = "Temps (jours)", ylab = "Valeur des dérivées",
+        main = "Dérivées du lissage pénalisé")
+legend("topleft", legend=c("Dérivée première", "Dérivée seconde"),
+       col=c("blue","red"), lty=1)
+```
+
+La dérivée première (courbe bleue) décrit la vitesse d'évolution des cas. Elle reste proche de zéro lors des périodes calmes, devient fortement positive au début des vagues (croissance rapide), puis négative lorsque les contaminations diminuent. Les variations les plus fortes apparaissent lors de la vague de janvier 2022, reflet d'une dynamique très rapide.
+
+La dérivée seconde (courbe rouge) indique l'accélération ou le ralentissement de l'épidémie. Elle met en évidence les changements de tendance : valeurs positives en phase d'accélération, négatives lors du ralentissement. Grâce au lissage pénalisé, cette dérivée est régulière et permet de repérer clairement les transitions entre les phases de croissance et de décroissance (notamment en 2022).
+
+### Lissage sur tous les pays
+
+Nous étendons cette procédure à l'ensemble de notre jeu de données. 
+
+```{r}
+basespline_pays <- create.bspline.basis(
+  rangeval = range(temps),
+  norder = 14,
+  breaks = temps)
+
+# Recherche sur une plage plus grande
+log_lambda_seq <- seq(2, 9, length.out = 21) 
+vecteur_lambda <- 10^log_lambda_seq
+gcv <- 1:21
+
+for (i in gcv){
+  lambda_i <- vecteur_lambda[i]
+  fdparTemp_i <- fdPar(basespline_pays, Lfdobj = 2, lambda = lambda_i)
+  # Lissage pénalisé
+  smoothdata_i <- smooth.basis(temps, matrice_cas, fdparTemp_i)
+  gcv[i] <- sum(smoothdata_i$gcv)
+}
+
+plot(gcv, type="b", main="Critère GCV en fonction de λ", xlab="λ", ylab="GCV")
+
+(best_index_pays <- which.min(gcv))
+(lambda_opt_pays <- vecteur_lambda[best_index_pays])
+```
+
+Le minimum du GCV est atteint pour λ correspondant à l'indice = 3, où λ optimal ≈ 501.19. Nous appliquons ainsi ce λ optimal pour générer les courbes de l'ensemble des pays.
+
+```{r}
+fdpar_opt_pays <- fdPar(basespline_pays, Lfdobj = 2, lambda = lambda_opt_pays)
+smooth_opt_pays <- smooth.basis(temps, matrice_cas, fdpar_opt_pays)
+fd_pays <- smooth_opt_pays$fd
+
+courbe_penalisee_pays <- eval.fd(temps, fd_pays)
+
+matplot(vecteur_dates, courbe_penalisee_pays, type = "l", lty = 1,
+        main = "Lissage pénalisé avec paramètre optimal pour tous les pays",
+        xlab = "Temps", ylab = "Nombre de cas")
+```
+
+Le lissage pénalisé met en évidence les grandes tendances épidémiques pour l'ensemble des pays.
+
+Nous utiliserons par la suite ce lissage pénalisé pour appliquer et interpréter les premières méthodes de statistique exploratoire, telles que la moyenne, la variance, la covariance et la corrélation, et afin de mener une analyse en composantes principales fonctionnelle.
+
+
+# Statistiques exploratoires fonctionnelles
+
+## Moyenne et écart-type fonctionnels
+
+L'analyse exploratoire fonctionnelle débute par l'examen des tendances centrales et de la dispersion. Nous calculons ici la moyenne fonctionnelle, qui représente la trajectoire type de l'épidémie mondiale, ainsi que l'écart-type fonctionnel, qui mesure l'évolution de la variabilité entre les pays au cours du temps.
+
+```{r}
+valeurs_moy  <- eval.fd(temps, mean.fd(fd_pays))     
+valeurs_std  <- eval.fd(temps, sd.fd(fd_pays))      
+
+matplot(temps, courbe_penalisee_pays, type="l", lty=1, col="grey",
+        main="Moyenne et écart-type fonctionnels",
+        xlab="Temps (jours)", ylab="Nombre de cas")
+
+# La moyenne
+lines(temps, valeurs_moy, col="black", lwd=3)
+
+# L'écart-type
+lines(temps, valeurs_moy + valeurs_std, col="blue", lty=2, lwd=2)
+lines(temps, valeurs_moy - valeurs_std, col="blue", lty=2, lwd=2)
+
+legend("topleft", legend=c("Moyenne", "Ecart-type"), 
+       col=c("black", "blue"), lty=c(1, 2), lwd=2)
+```
+
+```{r}
+plot(vecteur_dates, valeurs_moy, type = "l", lwd = 2, col = 'black',
+     main = "Nombre de cas moyen",
+     xlab = "Date", ylab = "Nombre de cas")
+```
+
+La courbe de la moyenne synthétise la dynamique globale de la pandémie au sein de notre échantillon de pays. Entre 2020 et 2021, on observe une succession de vagues d'amplitudes croissantes (maximum autour de 35 000 cas). Début 2022, on observe que la moyenne s'envole verticalement pour atteindre un pic de plus de 120 000 cas.
+
+```{r}
+plot(vecteur_dates, valeurs_std, type = "l", lwd = 2, col = "blue",
+     main = "Variabilité entre les pays",
+     xlab = "Date", ylab = "Écart-type (Nombre de cas)")
+```
+
+Entre 2020 et 2021, l'écart-type reste globalement modéré, ce qui indique que durant les deux premières années, les 20 pays de l'échantillon ont suivi des trajectoires assez similaires. On note toutefois une augmentation ponctuelle de la variabilité au printemps 2021. À l'inverse, en 2022, l'écart-type augmente drastiquement. Cela traduit de fortes disparités entre les pays. En effet, certains pays ont enregistré des records de contaminations à cette période.
+
+## Covariance
+
+Au-delà de la variabilité instantanée, il est nécessaire de comprendre la structure de dépendance temporelle du processus. La fonction de covariance bivariée permet de visualiser comment les variations du nombre de cas à un instant s sont liées à celles observées à un instant t.
+
+```{r}
+covariance <- var.fd(fd_pays)
+
+matrice_cov <- eval.bifd(temps, temps, covariance)
+
+filled.contour(
+  x = vecteur_dates, 
+  y = vecteur_dates, 
+  z = matrice_cov,
+  main = "Surface de covariance du nombre de cas",
+  xlab = "Date à l'instant s",
+  ylab = "Date à l'instant t",
+  key.title = title(main = "Cov")
+)
+```
+
+On remarque une concentration majeure de la variance (zone rouge en haut à droite) située début 2022. Cela indique que c'est à ce moment précis que les écarts d'intensité entre les pays ont été les plus massifs.
+
+Cette structure témoigne d'une forte hétéroscédasticité du processus épidémique : la variabilité n'est pas constante. Avant 2022, la surface reste majoritairement jaune/orangée, signe d'une variance inter-pays beaucoup plus faible et d'une plus grande homogénéité des situations nationales.
+
+## Corrélation
+
+Nous utilisons la surface de corrélation fonctionnelle afin d'analyser le degré de dépendance linéaire entre les différentes vagues épidémiques.
+
+```{r}
+matrice_corr <- cov2cor(matrice_cov)
+
+filled.contour(
+  x = vecteur_dates, 
+  y = vecteur_dates, 
+  z = matrice_corr,
+  main = "Surface de corrélation",
+  xlab = "Date",
+  ylab = "Date",
+  key.title = title(main = "Corr")
+)
+```
+
+La matrice laisse apparaître une structure par blocs le long de la diagonale. On distingue nettement des blocs de forte corrélation (carrés rouges) (fin 2020, fin 2021). Ces périodes correspondent aux pics des vagues majeures. À l'inverse, on remarque une baisse d'intensité de la corrélation mi-2021. Cela signifie que la dynamique de propagation change à cette période (cela peut être due à l'arrivée massive de la vaccination par exemple).
+
+## ACP fonctionnelle
+
+Afin de synthétiser l'information contenue dans les 20 courbes et de dégager les principaux modes de variation, nous réalisons une Analyse en Composantes Principales fonctionnelle.
+
+```{r}
+pca_res <- pca.fd(fd_pays, nharm = 4)
+
+plot(pca_res$varprop, type="b", col="blue", pch=19,
+     main="Part de variance expliquée par composante", ylab="% Variance")
+```
+
+Le graphique montre donc la contribution de chaque composante principale à l'explication de la variabilité totale des données.
+
+On remarque que la première composante est très élevée, avec plus de 60% de la variance expliquée. Cela signifie qu'une très grande partie des différences entre les pays s'explique par cette première composante. La deuxième composante est plus faible mais reste significative (presque 20% de la variance expliquée). Après la deuxième composante, la courbe s'aplatit et les valeurs deviennent négligeables. Cela justifie le fait de ne garder que les deux premiers axes pour l'analyse.
+
+```{r}
+scores <- pca_res$scores
+df_scores <- data.frame(pays = colnames(matrice_cas), PC1 = scores[,1], PC2 = scores[,2])
+
+ggplot(df_scores, aes(x=PC1, y=PC2, label=pays)) +
+  geom_point(color="red") +
+  geom_text(vjust=-0.5, size=3) +
+  geom_hline(yintercept=0, linetype="dashed") +
+  geom_vline(xintercept=0, linetype="dashed") +
+  labs(title="Analyse en Composante Principales fonctionnelles",
+       x=paste0("Axe 1 (", round(pca_res$varprop[1]*100, 1), "%)"),
+       y=paste0("Axe 2 (", round(pca_res$varprop[2]*100, 1), "%)")) +
+  theme_minimal()
+```
+
+La projection des pays sur le premier plan factoriel nous permet de dresser une typologie des dynamiques épidémiques.
+
+L'axe 1 :
+
+On retrouve vers la droite (valeurs positives) les pays qui ont connu plusieurs vagues massives tout au long de la période (France, Inde, USA). À l'inverse, vers la gauche (valeurs négatives), on trouve les pays comme le Japon, le Mexique ou encore l'Indonésie qui ont eu des pics de contaminations plus fiables. 
+
+L'axe 2:
+
+Il oppose les pays à pic précoce aux pays à pic tardif. En effet, l'Inde qui se trouve en bas a connu un pic de contaminations en 2021. À l'inverse, des pays comme la Corée du Sud, le Vietnam ou encore l'Allemagne ont connu des pics de contaminations en 2022.
+
+Cette analyse confirme que la pandémie ne s'est pas résumée à une vague unique mondiale homogène. Elle révèle d'une part des disparités marquées d'intensité globale (Axe 1), et d'autre part une forte désynchronisation temporelle des pics majeurs entre les pays (Axe 2).
+
+# Conclusion
+
+L'objectif de cette étude était d'analyser la dynamique temporelle de la pandémie de COVID-19 à l'aide des outils de la statistique fonctionnelle. L'application de ces méthodes sur un échantillon de 20 pays a permis de mettre en évidence plusieurs résultats majeurs.
+
+En premier lieu, le lissage par B-splines pénalisées s'est révélé indispensable pour filtrer le bruit et extraire la tendance épidémique réelle. L'analyse de la moyenne et l'écart-type fonctionnels a ensuite révélé la nature non-stationnaire et hétéroscédastique du processus : si les années 2020-2021 témoignent d'une relative homogénéité des trajectoires, l'année 2022 marque une rupture nette. En effet, un pic vertical du nombre de cas de COVID-19 est observable.
+
+Par ailleurs, l'étude de la structure de corrélation a confirmé une organisation temporelle par "blocs". Elle démontre que si l'épidémie possède une forte inertie à court terme, les différentes vagues successives sont statistiquement indépendantes.
+
+Enfin, l'Analyse en Composantes Principales fonctionnelle a permis de synthétiser cette complexité multidimensionnelle. La projection sur le premier plan factoriel a objectivé une typologie des pays selon deux axes structurants : l'intensité cumulée de la circulation virale (Axe 1) et la temporalité des pics majeurs (Axe 2), opposant notamment les profils précoces (Inde) aux profils tardifs (Corée du Sud, USA...).
+
+En somme, ces résultats montrent que la dynamique mondiale du COVID-19 n'a pas suivi une évolution uniforme, mais plutôt une succession de vagues avec des intensités très contrastées selon les régions du monde. Notre étude permet ainsi de mettre en évidence les régularités mondiales, mais aussi des singularités nationales, comme par exemple dans le cas de la France, qui seraient difficiles à identifier à partir des courbes brutes.
